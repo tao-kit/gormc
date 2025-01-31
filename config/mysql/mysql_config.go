@@ -1,8 +1,10 @@
-package gormc
+package mysql
 
 import (
 	"errors"
 	"fmt"
+	"github.com/tao-kit/gormc/config"
+	"github.com/tao-kit/gormc/plugins"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -16,10 +18,10 @@ type Mysql struct {
 	Dbname        string // 数据库名
 	Username      string // 数据库用户名
 	Password      string // 数据库密码
-	MaxIdleConns  int    `json:",default=10"`                               // 空闲中的最大连接数
-	MaxOpenConns  int    `json:",default=10"`                               // 打开到数据库的最大连接数
-	LogMode       string `json:",default=dev,options=dev|test|prod|silent"` // 是否开启Gorm全局日志
-	LogZap        bool   // 是否通过zap写入日志文件
+	MaxIdleConns  int    `json:",default=10"` // 空闲中的最大连接数
+	MaxOpenConns  int    `json:",default=10"` // 打开到数据库的最大连接数
+	LogMode       string `json:",default=dev,options=dev|test|prod|silent"`
+	LogColorful   bool   `json:",default=false"` // 是否开启日志高亮
 	SlowThreshold int64  `json:",default=1000"`
 }
 
@@ -28,26 +30,25 @@ func (m *Mysql) Dsn() string {
 }
 
 func (m *Mysql) GetGormLogMode() logger.LogLevel {
-	return overwriteGormLogMode(m.LogMode)
+	return config.OverwriteGormLogMode(m.LogMode)
 }
 
 func (m *Mysql) GetSlowThreshold() time.Duration {
 	return time.Duration(m.SlowThreshold) * time.Millisecond
 }
 func (m *Mysql) GetColorful() bool {
-	return true
+	return m.LogColorful
 }
 
-func ConnectMysql(m Mysql) (*gorm.DB, error) {
+func Connect(m Mysql) (*gorm.DB, error) {
 	if m.Dbname == "" {
 		return nil, errors.New("database name is empty")
 	}
 	mysqlCfg := mysql.Config{
 		DSN: m.Dsn(),
 	}
-	newLogger := newDefaultGormLogger(&m)
+	newLogger := config.NewDefaultGormLogger(&m)
 	db, err := gorm.Open(mysql.New(mysqlCfg), &gorm.Config{
-		//Logger: logger.Default.LogMode(logger.Info),
 		Logger: newLogger,
 	})
 	if err != nil {
@@ -58,4 +59,28 @@ func ConnectMysql(m Mysql) (*gorm.DB, error) {
 		sqldb.SetMaxOpenConns(m.MaxOpenConns)
 		return db, nil
 	}
+}
+
+func ConnectWithConfig(m Mysql, cfg *gorm.Config) (*gorm.DB, error) {
+	if m.Dbname == "" {
+		return nil, errors.New("database name is empty")
+	}
+	mysqlCfg := mysql.Config{
+		DSN: m.Dsn(),
+	}
+	db, err := gorm.Open(mysql.New(mysqlCfg), cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	err = plugins.InitPlugins(db)
+	if err != nil {
+		return nil, err
+	}
+
+	sqldb, _ := db.DB()
+	sqldb.SetMaxIdleConns(m.MaxIdleConns)
+	sqldb.SetMaxOpenConns(m.MaxOpenConns)
+	return db, nil
+
 }

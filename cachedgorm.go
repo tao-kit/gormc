@@ -3,13 +3,14 @@ package gormc
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 
-	"github.com/sllt/tao/core/mathx"
-	"github.com/sllt/tao/core/stores/cache"
-	"github.com/sllt/tao/core/stores/redis"
-	"github.com/sllt/tao/core/syncx"
-	"github.com/sllt/tao/core/trace"
+	"github.com/tao-kit/tao/core/mathx"
+	"github.com/tao-kit/tao/core/stores/cache"
+	"github.com/tao-kit/tao/core/stores/redis"
+	"github.com/tao-kit/tao/core/syncx"
+	"github.com/tao-kit/tao/core/trace"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -45,12 +46,16 @@ type (
 	// PrimaryQueryCtxFn defines the query method that based on primary keys.
 	PrimaryQueryCtxFn func(conn *gorm.DB, v, primary interface{}) error
 	// QueryCtxFn defines the query method.
-	QueryCtxFn func(conn *gorm.DB, v interface{}) error
+	QueryCtxFn func(conn *gorm.DB) error
 
 	CachedConn struct {
 		db                 *gorm.DB
 		cache              cache.Cache
 		unstableExpiryTime mathx.Unstable
+	}
+
+	Conn struct {
+		db *gorm.DB
 	}
 )
 
@@ -113,6 +118,20 @@ func (cc CachedConn) ExecCtx(ctx context.Context, execCtx ExecCtxFn, keys ...str
 }
 
 // ExecNoCache runs exec with given sql statement, without affecting cache.
+func (cc Conn) ExecNoCache(exec ExecCtxFn) error {
+	return cc.ExecNoCacheCtx(context.Background(), exec)
+}
+
+// ExecNoCacheCtx runs exec with given sql statement, without affecting cache.
+func (cc Conn) ExecNoCacheCtx(ctx context.Context, execCtx ExecCtxFn) (err error) {
+	ctx, span := startSpan(ctx, "ExecNoCache")
+	defer func() {
+		endSpan(span, err)
+	}()
+	return execCtx(cc.db.WithContext(ctx))
+}
+
+// ExecNoCache runs exec with given sql statement, without affecting cache.
 func (cc CachedConn) ExecNoCache(exec ExecCtxFn) error {
 	return cc.ExecNoCacheCtx(context.Background(), exec)
 }
@@ -166,16 +185,16 @@ func (cc CachedConn) QueryCtx(ctx context.Context, v interface{}, key string, qu
 		endSpan(span, err)
 	}()
 	return cc.cache.TakeCtx(ctx, v, key, func(v interface{}) error {
-		return query(cc.db.WithContext(ctx), v)
+		return query(cc.db.WithContext(ctx))
 	})
 }
 
-func (cc CachedConn) QueryNoCacheCtx(ctx context.Context, v interface{}, query QueryCtxFn) (err error) {
+func (cc CachedConn) QueryNoCacheCtx(ctx context.Context, query QueryCtxFn) (err error) {
 	ctx, span := startSpan(ctx, "QueryNoCache")
 	defer func() {
 		endSpan(span, err)
 	}()
-	return query(cc.db.WithContext(ctx), v)
+	return query(cc.db.WithContext(ctx))
 }
 
 // QueryWithExpireCtx unmarshals into v with given key, set expire duration and query func.
@@ -184,15 +203,33 @@ func (cc CachedConn) QueryWithExpireCtx(ctx context.Context, v interface{}, key 
 	defer func() {
 		endSpan(span, err)
 	}()
-	err = query(cc.db.WithContext(ctx), v)
+	err = cc.cache.TakeCtx(ctx, v, key, func(v interface{}) error {
+		return query(cc.db.WithContext(ctx))
+	})
 	if err != nil {
 		return err
 	}
 	return cc.cache.SetWithExpireCtx(ctx, key, v, cc.aroundDuration(expire))
-	//return cc.cache.TakeWithSetExpireCtx(ctx, v, key, expire, func(val interface{}) error {
-	//	return query(cc.db.WithContext(ctx), v)
-	//})
 }
+
+// QueryWithCallbackExpireCtx unmarshals into v with given key, set expire duration from callback and query func.
+func (cc CachedConn) QueryWithCallbackExpireCtx(ctx context.Context, v interface{}, key string, query QueryCtxFn, callback func(interface{}) time.Duration) (err error) {
+	ctx, span := startSpan(ctx, "QueryWithCallbackExpire")
+	defer func() {
+		endSpan(span, err)
+	}()
+	err = cc.cache.TakeCtx(ctx, v, key, func(v interface{}) error {
+		return query(cc.db.WithContext(ctx))
+	})
+	if err != nil {
+		return err
+	}
+	if callback == nil {
+		return cc.QueryCtx(ctx, v, key, query)
+	}
+	return cc.cache.SetWithExpireCtx(ctx, key, v, callback(v))
+}
+
 func (cc CachedConn) aroundDuration(duration time.Duration) time.Duration {
 	return cc.unstableExpiryTime.AroundDuration(duration)
 }
@@ -238,7 +275,7 @@ func startSpan(ctx context.Context, method string) (context.Context, oteltrace.S
 func endSpan(span oteltrace.Span, err error) {
 	defer span.End()
 
-	if err == nil || err == ErrNotFound {
+	if err == nil || errors.Is(err, ErrNotFound) {
 		span.SetStatus(codes.Ok, "")
 		return
 	}
